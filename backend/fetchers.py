@@ -4,6 +4,8 @@ import requests
 import akshare as ak
 import pandas as pd
 import datetime as _dt
+import json
+
 
 # ---------- 缓存 ----------
 _cache_cn_df = None
@@ -35,6 +37,20 @@ FUND_WATCHLIST = [
     {"code": "000991", "name": "工银战略转型股票A"},
     {"code": "481001", "name": "工银核心价值混合A"},
     {"code": "001008", "name": "工银国企改革股票"},
+]
+
+GLOBAL_INDICES = [
+    {"name": "道琼斯",     "sina_code": "int_dji",    "tx_code": "usDJI",    "type": "global"},
+    {"name": "纳斯达克",   "sina_code": "int_nasdaq", "tx_code": "usIXIC",   "type": "global"},
+    {"name": "标普500",    "sina_code": "int_sp500",  "tx_code": "usINX",    "type": "global"},
+    {"name": "英国富时",   "sina_code": "znb_UKX",    "tx_code": "ukFTSE",   "type": "global"},
+    {"name": "德国DAX",    "sina_code": "znb_DAX",    "tx_code": "deDAX",    "type": "global"},
+    {"name": "法国CAC",    "sina_code": "znb_CAC",    "tx_code": "frCAC",    "type": "global"},
+    {"name": "日经指数",   "sina_code": "znb_NKY",    "tx_code": "jpN225",   "type": "global"},
+    {"name": "恒生指数",   "sina_code": "rt_hkHSI",   "tx_code": "hkHSI",    "type": "hk"},
+    {"name": "上证指数",   "sina_code": "sh000001",   "tx_code": "sh000001", "type": "a_share"},
+    {"name": "深证成指",   "sina_code": "sz399001",   "tx_code": "sz399001", "type": "a_share"},
+    {"name": "创业板指",   "sina_code": "sz399006",   "tx_code": "sz399006", "type": "a_share"},
 ]
 
 # ---------- 实时行情 / 国内油价 ----------
@@ -151,7 +167,165 @@ def fetch_us_treasury_yields():
         except Exception: pass
     return result
 
-# ---------- A 股 / 个股 ----------
+# ---------- A 股 / 个股 / 全球指数 ----------
+def fetch_global_indices_quotes():
+    """获取全球主要指数的实时行情"""
+    codes = [idx["sina_code"] for idx in GLOBAL_INDICES]
+    url = f"https://hq.sinajs.cn/list={','.join(codes)}"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+    parsed = {}
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.encoding = "gbk"
+        for line in resp.text.split(";"):
+            match = re.search(r'hq_str_(\w+)="([^"]*)"', line)
+            if match:
+                code = match.group(1)
+                fields = match.group(2).split(",")
+                idx_conf = next((i for i in GLOBAL_INDICES if i["sina_code"] == code), None)
+                if not idx_conf or len(fields) < 4: continue
+                
+                try:
+                    if idx_conf["type"] == "global":
+                        parsed[code] = {"price": round(float(fields[1]), 2), "change_pct": round(float(fields[3]), 2)}
+                    elif idx_conf["type"] == "hk":
+                        parsed[code] = {"price": round(float(fields[6]), 2), "change_pct": round(float(fields[8]), 2)}
+                    else:
+                        prev_close = float(fields[2])
+                        price = float(fields[3])
+                        pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+                        parsed[code] = {"price": round(price, 2), "change_pct": round(pct, 2)}
+                except (ValueError, IndexError):
+                    pass
+    except Exception: pass
+    return [{**idx, "price": parsed.get(idx["sina_code"], {}).get("price"), "change_pct": parsed.get(idx["sina_code"], {}).get("change_pct")} for idx in GLOBAL_INDICES]
+
+def _fetch_tencent_kline(tx_code: str):
+    """获取腾讯指数日K线，解析 JSONP 格式"""
+    try:
+        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+
+        params = {
+            "_var": "kline_dayqfq",
+            "param": f"{tx_code},day,,,320,qfq"
+        }
+
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        resp = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=15
+        )
+        resp.raise_for_status()
+
+        # 腾讯返回格式：kline_dayqfq={...}
+        raw = resp.text.strip()
+
+        if "=" in raw:
+            raw = raw.split("=", 1)[1].strip()
+
+        raw = raw.rstrip(";")
+
+        data = json.loads(raw)
+
+        kline_data = data.get("data", {}).get(tx_code, {})
+        days = kline_data.get("day") or kline_data.get("qfqday")
+
+        if not days:
+            print(f"腾讯K线 {tx_code} 返回为空")
+            return []
+
+        records = []
+
+        for item in days:
+            if len(item) < 3:
+                continue
+
+            try:
+                records.append({
+                    "date": item[0],
+                    "value": float(item[2])
+                })
+            except (ValueError, TypeError):
+                continue
+
+        return records
+
+    except Exception as e:
+        print(f"腾讯K线获取失败 ({tx_code}): {repr(e)}")
+        return []
+
+def fetch_global_index_history(tx_code: str):
+    """根据指数代码选择历史数据源，统一返回最近365天的 date/value"""
+
+    try:
+        # 1. 美国主要指数
+        us_symbols = {
+            "usDJI": ".DJI",
+            "usIXIC": ".IXIC",
+            "usINX": ".INX",
+        }
+
+        if tx_code in us_symbols:
+            df = ak.index_us_stock_sina(
+                symbol=us_symbols[tx_code]
+            )
+
+            return _normalize_history_df(
+                df, "date", "close", days=365
+            )
+
+        # 2. 欧洲及日本指数
+        global_symbols = {
+            "ukFTSE": "英国富时100指数",
+            "deDAX": "德国DAX 30种股价指数",
+            "frCAC": "法CAC40指数",
+            "jpN225": "日经225指数",
+        }
+
+        if tx_code in global_symbols:
+            df = ak.index_global_hist_sina(
+                symbol=global_symbols[tx_code]
+            )
+
+            # 排除未完成行情产生的零收盘价记录
+            df = df[
+                pd.to_numeric(df["close"], errors="coerce") > 0
+            ].copy()
+
+            return _normalize_history_df(
+                df, "date", "close", days=365
+            )
+
+        # 3. 恒生指数
+        if tx_code == "hkHSI":
+            df = ak.stock_hk_index_daily_sina(
+                symbol="HSCCI"
+            )
+
+            return _normalize_history_df(
+                df, "date", "close", days=365
+            )
+
+        # 4. A股指数：继续使用已经验证成功的腾讯接口
+        records = _fetch_tencent_kline(tx_code)
+
+        df = pd.DataFrame(records)
+
+        return _normalize_history_df(
+            df, "date", "value", days=365
+        )
+
+    except Exception as e:
+        print(
+            f"全球指数历史数据获取失败 ({tx_code}): {repr(e)}"
+        )
+        return []
+
 def fetch_tencent_quotes(codes):
     result = {}
     if not codes: return result
@@ -243,7 +417,6 @@ def fetch_watchlist_quotes():
     except Exception: pass
     return [{**item, "price": parsed.get(item["full_code"], {}).get("price"), "change": parsed.get(item["full_code"], {}).get("change"), "change_pct": parsed.get(item["full_code"], {}).get("change_pct")} for item in WATCHLIST]
 
-# ---------- 历史数据（股票/分钟） ----------
 def fetch_stock_history(full_code: str, days: int = 365):
     end = _dt.date.today()
     start = end - _dt.timedelta(days=days + 120)
@@ -283,245 +456,81 @@ def fetch_stock_minute(full_code: str):
         if df is None or df.empty: return []
         df['day'] = pd.to_datetime(df['day'])
         df = df[df['day'].dt.date == df['day'].dt.date.max()].copy()
-        df['close'] = pd.to_numeric(df['close'], errors="coerce")
-        df['volume'] = pd.to_numeric(df['volume'], errors="coerce")
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
         df['amount'] = df['close'] * df['volume']
         df['avg_price'] = df['amount'].cumsum() / df['volume'].cumsum()
         return [{"time": row['day'].strftime("%H:%M"), "price": round(float(row['close']), 2), "avg_price": round(float(row['avg_price']), 2), "volume": int(row['volume']) if not pd.isna(row['volume']) else 0} for _, row in df.iterrows()]
     except Exception: return []
 
-# ================= 宏观历史曲线终极版（直接解析底层 K 线接口） =================
-
-
-def _normalize_history_df(
-    df,
-    date_col_hint=None,
-    value_col_hint=None,
-    days=365
-):
-    """
-    统一历史数据格式：
-    1. 日期格式标准化
-    2. 数值格式标准化
-    3. 清除无效数据
-    4. 按自然日筛选最近一年
-    5. 按日期升序排列
-
-    返回格式：[{"date": "...", "value": ...}]
-    """
-
-    if df is None or df.empty:
-        return []
-
-    date_col = (
-        date_col_hint
-        if date_col_hint in df.columns
-        else df.columns[0]
-    )
-
-    value_col = (
-        value_col_hint
-        if value_col_hint in df.columns
-        else df.columns[-1]
-    )
-
+def _normalize_history_df(df, date_col_hint=None, value_col_hint=None, days=365):
+    if df is None or df.empty: return []
+    date_col = date_col_hint if date_col_hint in df.columns else df.columns[0]
+    value_col = value_col_hint if value_col_hint in df.columns else df.columns[-1]
     df = df.copy()
-
-    df[date_col] = pd.to_datetime(
-        df[date_col],
-        errors="coerce"
-    )
-
-    df[value_col] = pd.to_numeric(
-        df[value_col],
-        errors="coerce"
-    )
-
-    # 清理无效数据
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
     df = df.dropna(subset=[date_col, value_col])
-
-    # 排除异常历史日期
-    df = df[
-        df[date_col] >= pd.Timestamp("2000-01-01")
-    ]
-
-    # 日期升序
+    df = df[df[date_col] >= pd.Timestamp("2000-01-01")]
     df = df.sort_values(date_col)
-
-    # 按自然日筛选最近一年
     if days and days > 0:
         today = pd.Timestamp.today().normalize()
         cutoff = today - pd.Timedelta(days=days)
-
-        df = df[
-            (df[date_col] >= cutoff) &
-            (df[date_col] <= today)
-        ]
-
-    # 转换成前端统一格式
-    result = []
-
-    for _, row in df.iterrows():
-        result.append({
-            "date": row[date_col].strftime("%Y-%m-%d"),
-            "value": round(float(row[value_col]), 4)
-        })
-
-    return result
-
-
-def _fetch_eastmoney_kline(secid):
-    """通用：请求东方财富底层 K 线 JSON 接口"""
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = {
-        "secid": secid,
-        "klt": "101", "fqt": "1", "lmt": "250", "end": "20500101",
-        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Referer": "https://quote.eastmoney.com/"
-    }
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=5)
-        data = resp.json()
-        klines = data.get("data", {}).get("klines", [])
-        records = []
-        for item in klines:
-            parts = item.split(",")
-            # 东财 K 线格式：日期(0), 开盘(1), 收盘(2), 最高(3), 最低(4)...
-            records.append({"date": parts[0], "value": float(parts[2])})
-        return records
-    except Exception as e:
-        print(f"东财K线获取失败 ({secid}): {e}")
-        return []
-
+        df = df[(df[date_col] >= cutoff) & (df[date_col] <= today)]
+    return [{"date": row[date_col].strftime("%Y-%m-%d"), "value": round(float(row[value_col]), 4)} for _, row in df.iterrows()]
 
 def _fetch_sina_forex_history(symbol, var_name, days=365):
-    """
-    获取新浪外汇历史日K线
-    数据格式：日期,开盘,最高,最低,收盘
-    """
-    url = (
-        "https://vip.stock.finance.sina.com.cn/forex/api/jsonp.php/"
-        f"var%20{var_name}=/NewForexService.getDayKLine"
-        f"?symbol={symbol}&_=1"
-    )
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://finance.sina.com.cn/"
-    }
-
+    url = f"https://vip.stock.finance.sina.com.cn/forex/api/jsonp.php/var%20{var_name}=/NewForexService.getDayKLine?symbol={symbol}&_=1"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
-
-        # 匹配新浪返回的 var 变量及括号中的历史数据
-        pattern = (
-            rf'var\s+{re.escape(var_name)}\s*=\s*'
-            r'\("([\s\S]*?)"\)\s*;?'
-        )
+        pattern = rf'var\s+{re.escape(var_name)}\s*=\s*\("([\s\S]*?)"\)\s*;?'
         match = re.search(pattern, resp.text)
-
-        if not match:
-            print(f"{symbol}：新浪接口数据格式不匹配")
-            print("响应开头：", repr(resp.text[:300]))
-            return []
-
+        if not match: return []
         raw_data = match.group(1)
         records = []
-
-        # 新浪使用 | 分隔每个交易日
         for line in raw_data.split("|"):
             parts = line.strip().split(",")
-
-            if len(parts) < 5:
-                continue
-
-            try:
-                records.append({
-                    "date": parts[0],
-                    "value": float(parts[4])  # 收盘价
-                })
-            except (ValueError, TypeError):
-                continue
-
-        if not records:
-            print(f"{symbol}：没有解析到有效历史数据")
-            return []
-
+            if len(parts) >= 5:
+                try: records.append({"date": parts[0], "value": float(parts[4])})
+                except (ValueError, TypeError): continue
+        if not records: return []
         df = pd.DataFrame(records)
-
-        # 按自然日筛选最近一年，而不是简单取365个交易日
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=days)
-
         df = df.dropna(subset=["date", "value"])
         df = df[df["date"] >= cutoff]
-
-        result = _normalize_history_df(
-            df, "date", "value", days=0
-        )
-
-        print(
-            f"{symbol}：成功获取 {len(result)} 条历史数据，"
-            f"范围：{result[0]['date'] if result else '无'}"
-            f" 至 {result[-1]['date'] if result else '无'}"
-        )
-
-        return result
-
+        return _normalize_history_df(df, "date", "value", days=0)
     except Exception as e:
         print(f"{symbol} 历史数据获取失败：{repr(e)}")
         return []
 
-
 def fetch_forex_history():
-    """离岸人民币 USD/CNH 历史曲线"""
-    return _fetch_sina_forex_history(
-        symbol="fx_susdcnh",
-        var_name="_fx_susdcnh",
-        days=365
-    )
-
+    return _fetch_sina_forex_history(symbol="fx_susdcnh", var_name="_fx_susdcnh", days=365)
 
 def fetch_dxy_history():
-    """美元指数 DXY 历史曲线"""
-    return _fetch_sina_forex_history(
-        symbol="DINIW",
-        var_name="_DINIW",
-        days=365
-    )
-
+    return _fetch_sina_forex_history(symbol="DINIW", var_name="_DINIW", days=365)
 
 def fetch_brent_history():
-    try:
-        return _normalize_history_df(ak.futures_foreign_hist(symbol="OIL"), "date", "close")
+    try: return _normalize_history_df(ak.futures_foreign_hist(symbol="OIL"), "date", "close")
     except Exception: return []
 
 def fetch_oil95_history():
-    try:
-        return _normalize_history_df(ak.energy_oil_hist(), "调整日期", "汽油价格")
+    try: return _normalize_history_df(ak.energy_oil_hist(), "调整日期", "汽油价格")
     except Exception: return []
 
 def fetch_gold_history_intl():
-    try:
-        return _normalize_history_df(ak.futures_foreign_hist(symbol="GC"), "date", "close")
+    try: return _normalize_history_df(ak.futures_foreign_hist(symbol="GC"), "date", "close")
     except Exception: return []
 
 def fetch_gold_history_domestic():
-    try:
-        return _normalize_history_df(ak.spot_hist_sge(symbol="Au99.99"), "date", "close")
+    try: return _normalize_history_df(ak.spot_hist_sge(symbol="Au99.99"), "date", "close")
     except Exception: return []
 
 def fetch_us_bond_history(symbol="美国5年期国债"):
-    try:
-        return _normalize_history_df(ak.bond_gb_us_sina(symbol=symbol), "date", "close")
+    try: return _normalize_history_df(ak.bond_gb_us_sina(symbol=symbol), "date", "close")
     except Exception: return []
-
-# ================= 基金功能 =================
 
 def fetch_fund_quote(code: str):
     try:

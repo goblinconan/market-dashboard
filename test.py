@@ -1,30 +1,64 @@
+import requests
+import json
 
-from datetime import date, timedelta
-
-today = date.today()
-cutoff = today - timedelta(days=365)
-
-tests = {
-    "国际原油": fetch_brent_history(),
-    "国内汽油": fetch_oil95_history(),
-    "国际黄金": fetch_gold_history_intl(),
-    "国内黄金": fetch_gold_history_domestic(),
-    "美国5年期国债": fetch_us_bond_history(),
-    "基金481017": fetch_fund_history("481017"),
+candidates = {
+    "英国富时": ["ukFTSE", "znb_UKX"],
+    "德国DAX": ["deDAX", "znb_DAX"],
+    "法国CAC": ["frCAC", "znb_CAC"],
+    "日经指数": ["jpN225", "znb_NKY"],
+    "道琼斯": ["usDJI", "int_dji"],
+    "纳斯达克": ["usIXIC", "int_nasdaq"],
+    "标普500": ["usINX", "int_sp500"],
 }
 
-for name, data in tests.items():
-    print("\n", "=" * 45)
+headers = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://finance.qq.com/"
+}
+
+for name, codes in candidates.items():
+    print("\n" + "=" * 55)
     print(name)
 
-    if not data:
-        print("没有获取到数据")
-        continue
+    for code in codes:
+        try:
+            response = requests.get(
+                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                params={
+                    "_var": "kline_dayqfq",
+                    "param": f"{code},day,,,320,qfq"
+                },
+                headers=headers,
+                timeout=10
+            )
 
-    dates = [date.fromisoformat(x["date"]) for x in data]
+            raw = response.text.strip()
 
-    print("数据条数：", len(data))
-    print("最早日期：", min(dates))
-    print("最新日期：", max(dates))
-    print("是否在最近一年：", min(dates) >= cutoff)
-    print("是否日期升序：", dates == sorted(dates))
+            if "=" in raw:
+                raw = raw.split("=", 1)[1].strip()
+
+            data = json.loads(raw)
+            root = data.get("data")
+
+            print(f"\n候选代码：{code}")
+            print("接口状态：", data.get("code"))
+
+            if isinstance(root, dict):
+                node = root.get(code, {})
+                if isinstance(node, dict):
+                    rows = node.get("qfqday") or node.get("day") or []
+                elif isinstance(node, list):
+                    rows = node
+                else:
+                    rows = []
+            else:
+                rows = []
+
+            print("K线数量：", len(rows))
+
+            if rows:
+                print("第一条：", rows[0])
+                print("最后一条：", rows[-1])
+
+        except Exception as e:
+            print(f"{code} 请求异常：{repr(e)}")
