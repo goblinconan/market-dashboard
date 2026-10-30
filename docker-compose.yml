@@ -1,0 +1,27 @@
+services:
+  backend:
+    build: ./backend
+    container_name: dashboard-backend
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - NO_PROXY=localhost,127.0.0.1,eastmoney.com,push2.eastmoney.com,push2his.eastmoney.com
+    networks:
+      - dashboard-net
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: dashboard-frontend
+    restart: unless-stopped
+    ports:
+      - "8084:80"
+    depends_on:
+      - backend
+    networks:
+      - dashboard-net
+
+networks:
+  dashboard-net:
+    driver: bridge
