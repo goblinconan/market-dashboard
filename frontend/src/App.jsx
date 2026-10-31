@@ -4,6 +4,7 @@ import FundHistoryChart from './components/FundHistoryChart.jsx';
 import FundWatchlist from './components/FundWatchlist.jsx';
 import IndexDetailModal from './components/IndexDetailModal.jsx'; // ← 顶部加
 import MiniTrendChart from './components/MiniTrendChart.jsx';
+import NewsSection from './components/NewsSection.jsx';
 import StockHistoryChart from './components/StockHistoryChart.jsx';
 import StockWatchlist from './components/StockWatchlist.jsx';
 
@@ -173,6 +174,9 @@ export default function App() {
           <FundHistoryChart code={fundSelected.code} name={fundSelected.name} />
 
           <GlobalIndicesSection indices={data.global_indices || []} />
+
+          {/* 在这里插入新闻板块 */}
+          <NewsSection />
         </>
       )}
     </div>

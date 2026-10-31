@@ -1,6 +1,10 @@
 import asyncio
 import time
 from contextlib import asynccontextmanager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +19,7 @@ from fetchers import (
     fetch_fund_watchlist, fetch_fund_history,
     fetch_global_indices_quotes, fetch_global_index_history, GLOBAL_INDICES,
     fetch_index_minute,
+    fetch_latest_news_from_mx,
 )
 
 REFRESH_INTERVAL = 60
@@ -26,6 +31,23 @@ snapshot_lock = asyncio.Lock()
 _minute_cache = {}
 _history_cache = {"data": None, "ts": 0}
 _history_cache_by_code = {}
+
+# 全局新闻缓存
+_news_cache = {"data": [], "last_update": 0}
+
+def update_news_cache():
+    """定时任务：更新新闻缓存"""
+    global _news_cache
+    print(f"[{time.strftime('%H:%M:%S')}] 🔄 正在更新政经新闻...")
+    news_data = fetch_latest_news_from_mx()
+    if news_data:
+        _news_cache["data"] = news_data
+        _news_cache["last_update"] = time.time()
+        print(f"[{time.strftime('%H:%M:%S')}] ✅ 新闻更新成功，共 {len(news_data)} 条")
+
+# 配置 APScheduler（每 10 分钟抓取一次）
+scheduler = AsyncIOScheduler()
+scheduler.add_job(update_news_cache, 'interval', minutes=1, id='news_job')
 
 def build_payload():
     wti, brent = fetch_intl_prices()
@@ -79,12 +101,34 @@ async def refresh_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 1. 启动新闻抓取（放到后台线程，不阻塞启动）
+    asyncio.create_task(asyncio.to_thread(update_news_cache))
+    scheduler.start()
+    
+    # 2. 启动你原有的数据推送循环
     task = asyncio.create_task(refresh_loop())
+    
     yield
+    
+    # 3. 关闭时清理
     task.cancel()
+    scheduler.shutdown()
 
-app = FastAPI(lifespan=lifespan)
+# 全局唯一的 app 定义
+app = FastAPI(title="Market Dashboard", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/api/news/latest")
+async def get_latest_news(limit: int = 15):
+    """前端获取最新新闻的接口"""
+    if not _news_cache["data"]:
+        # 如果缓存为空，强制刷新一次
+        update_news_cache()
+    
+    return {
+        "updated_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_news_cache["last_update"])),
+        "news": _news_cache["data"][:limit]
+    }
 
 @app.get("/api/health")
 async def health(): return {"status": "ok"}

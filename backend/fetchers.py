@@ -800,3 +800,183 @@ def _fetch_global_index_history_mx(tx_code: str):
         print(f"妙想 API 历史失败 {tx_code}: {repr(e)}")
         
     return []
+
+# ============================================================
+# 实时政经新闻采集（基于妙想 API）
+# ============================================================
+import datetime
+
+
+def classify_news(title, summary):
+    """根据新闻标题和摘要进行自动分类"""
+    content = f"{title} {summary}".lower()
+
+    category_keywords = {
+        "国际政治": [
+            "外交", "战争", "制裁", "总统", "国际关系",
+            "谈判", "伊朗", "俄乌", "白宫", "峰会",
+            "选举", "关税", "地缘政治",
+            "首相", "英国政府", "奴隶贸易", "卡塔尔"
+        ],
+        "国内政策": [
+            "国务院", "发改委", "财政部", "央行",
+            "证监会", "监管", "政策", "政府工作",
+            "货币政策", "财政政策", "中国人民银行"
+        ],
+        "宏观经济": [
+            "gdp", "通胀", "cpi", "ppi", "利率",
+            "美联储", "欧洲央行", "经济增长",
+            "失业率", "就业", "制造业", "经济数据",
+            "大额存单", "存款利率", "银行"
+        ],
+        "股市": [
+            "a股", "港股", "美股", "股市", "股票",
+            "上证指数", "深证成指", "创业板",
+            "上市公司", "证券市场", "成交额"
+        ],
+        "债券": [
+            "国债", "债券", "收益率", "信用债",
+            "地方债", "专项债", "国债期货"
+        ],
+        "大宗商品": [
+            "原油", "黄金", "白银", "铜价", "铜",
+            "铝价", "天然气", "铁矿石", "煤炭",
+            "大宗商品", "期货"
+        ]
+    }
+
+    # 按分类顺序匹配，命中第一个分类即返回
+    for category, keywords in category_keywords.items():
+        if any(keyword in content for keyword in keywords):
+            return category
+
+    return "其他"
+
+
+# 请确保在文件顶部已定义 MX_APIKEY 和 MX_API_URL
+
+
+def fetch_latest_news_from_mx():
+    """
+    从东方财富7×24全球财经快讯获取实时新闻。
+    返回最新20条新闻。
+    """
+    api_url = "https://np-listapi.eastmoney.com/comm/web/getFastNewsList"
+
+    params = {
+        "client": "web",
+        "biz": "web_724",
+        "fastColumn": "102",
+        "sortEnd": "",
+        "pageSize": "50",
+        "req_trace": str(int(time.time() * 1000))
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://kuaixun.eastmoney.com/",
+        "Accept": "application/json, text/plain, */*"
+    }
+
+    try:
+        resp = requests.get(
+            api_url,
+            params=params,
+            headers=headers,
+            timeout=20,
+            proxies={"http": None, "https": None}
+        )
+        resp.raise_for_status()
+
+        result = resp.json()
+
+        if str(result.get("code")) != "1":
+            print("东方财富新闻接口返回异常:", result.get("message"))
+            return []
+
+        data = result.get("data") or {}
+        news_list = data.get("fastNewsList") or []
+
+        news_records = []
+
+        for item in news_list:
+            title = item.get("title", "").strip()
+            summary = item.get("summary", "").strip()
+
+            if not title:
+                continue
+
+            news_records.append({
+                "id": str(item.get("code", "")),
+                "title": title,
+                "summary": summary,
+                "url": f"https://finance.eastmoney.com/a/{item.get('code')}.html",
+                "time": item.get("showTime", ""),
+                "source": "东方财富7×24",
+                "category": classify_news(title, summary)
+            })
+
+            if len(news_records) >= 20:
+                break
+
+        print(f"东方财富新闻获取成功，共 {len(news_records)} 条")
+        return news_records
+
+    except Exception as e:
+        print(f"东方财富新闻获取失败: {repr(e)}")
+        return []
+
+
+def _get_fallback_news():
+    """兜底测试新闻，防止接口异常导致前端空白"""
+    now_str = datetime.datetime.now().strftime("%m-%d %H:%M")
+    return [
+        {
+            "id": "1",
+            "title": "央行开展5000亿元中期借贷便利（MLF）操作，利率维持不变",
+            "summary": "为维护银行体系流动性合理充裕，央行今日进行公开市场操作...",
+            "url": "https://www.eastmoney.com/",
+            "time": now_str,
+            "source": "宏观政策"
+        },
+        {
+            "id": "2",
+            "title": "美联储官员释放鸽派信号，暗示年内可能进一步降息",
+            "summary": "多位美联储票委表示，当前通胀数据已接近目标，需关注劳动力市场下行风险...",
+            "url": "https://www.eastmoney.com/",
+            "time": now_str,
+            "source": "国际财经"
+        },
+        {
+            "id": "3",
+            "title": "国家发改委：加快推进新型基础设施建设，重点布局算力网络",
+            "summary": "发改委今日召开新闻发布会，明确了下一阶段新基建的重点投资方向...",
+            "url": "https://www.eastmoney.com/",
+            "time": now_str,
+            "source": "产业政策"
+        },
+        {
+            "id": "4",
+            "title": "全球主要经济体关注通胀走势及货币政策调整",
+            "summary": "市场持续关注各国央行政策信号，以及利率变化对全球经济和金融市场的影响。",
+            "url": "https://www.eastmoney.com/",
+            "time": now_str,
+            "source": "全球经济"
+        },
+        {
+            "id": "5",
+            "title": "国际能源市场关注原油供需及价格变化",
+            "summary": "能源市场参与者持续评估全球供应、需求和地缘因素对原油价格的影响。",
+            "url": "https://www.eastmoney.com/",
+            "time": now_str,
+            "source": "大宗商品"
+        },
+        {
+            "id": "6",
+            "title": "国内资本市场持续关注上市公司业绩与产业发展",
+            "summary": "投资者关注上市公司经营表现、产业政策变化及重点行业的发展趋势。",
+            "url": "https://www.eastmoney.com/",
+            "time": now_str,
+            "source": "资本市场"
+        }
+    ]
