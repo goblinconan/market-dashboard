@@ -1,32 +1,19 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import DashboardGrid from './components/DashboardGrid.jsx'
-import FundHistoryChart from './components/FundHistoryChart.jsx'
-import FundWatchlist from './components/FundWatchlist.jsx'
-import MiniTrendChart from './components/MiniTrendChart.jsx'
-import StockHistoryChart from './components/StockHistoryChart.jsx'
-import StockWatchlist from './components/StockWatchlist.jsx'
+import { useCallback, useEffect, useRef, useState } from 'react';
+import DashboardGrid from './components/DashboardGrid.jsx';
+import FundHistoryChart from './components/FundHistoryChart.jsx';
+import FundWatchlist from './components/FundWatchlist.jsx';
+import IndexDetailModal from './components/IndexDetailModal.jsx'; // ← 顶部加
+import MiniTrendChart from './components/MiniTrendChart.jsx';
+import StockHistoryChart from './components/StockHistoryChart.jsx';
+import StockWatchlist from './components/StockWatchlist.jsx';
 
 const WS_URL = window.location.protocol === 'https:'
   ? `wss://${window.location.host}/ws`
   : `ws://${window.location.host}/ws`
 
 function GlobalIndicesSection({ indices }) {
-  const [selected, setSelected] = useState('道琼斯')
-  const [chartData, setChartData] = useState([])
-  const [loadingChart, setLoadingChart] = useState(false)
-
-  useEffect(() => {
-    if (!selected) return
-    setLoadingChart(true)
-    // 动态请求当前选中的指数历史数据
-    fetch(`/api/global_indices/history?name=${encodeURIComponent(selected)}`)
-      .then(res => res.json())
-      .then(data => {
-        setChartData(Array.isArray(data) ? data : [])
-      })
-      .catch(() => setChartData([]))
-      .finally(() => setLoadingChart(false))
-  }, [selected])
+  const [selected, setSelected] = useState(null)   // null=关闭，字符串=打开的指数名
+  const activeName = selected || indices?.[0]?.name
 
   if (!indices || indices.length === 0) return null
 
@@ -38,13 +25,15 @@ function GlobalIndicesSection({ indices }) {
           const isUp = item.change_pct > 0
           const isDown = item.change_pct < 0
           const color = isUp ? '#0f9d58' : isDown ? '#db4437' : '#9aa0a6'
-          const isSelected = selected === item.name
+          const isSelected = activeName === item.name
           return (
             <div key={item.name} onClick={() => setSelected(item.name)}
                  style={{
-                   background: '#1a1d23', border: `1px solid ${isSelected ? '#4285f4' : '#2a2e36'}`, 
+                   background: '#1a1d23',
+                   border: `1px solid ${isSelected ? '#4285f4' : '#2a2e36'}`,
                    borderRadius: 10, padding: '12px 14px', cursor: 'pointer',
-                   boxShadow: isSelected ? '0 0 0 1px #4285f4' : 'none'
+                   boxShadow: isSelected ? '0 0 0 1px #4285f4' : 'none',
+                   transition: 'border-color .15s'
                  }}>
               <div style={{ fontSize: 14, fontWeight: 500, color: '#e8eaed', marginBottom: 6 }}>{item.name}</div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
@@ -59,15 +48,9 @@ function GlobalIndicesSection({ indices }) {
           )
         })}
       </div>
-      
-      {loadingChart ? (
-        <div style={{ height: 220, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9aa0a6', marginTop: 10 }}>正在加载 {selected} 历史走势...</div>
-      ) : chartData.length > 0 ? (
-        <div style={{ marginTop: 10 }}>
-          <MiniTrendChart title={`${selected} 近一年走势`} data={chartData} color="#4285f4" />
-        </div>
-      ) : (
-        <div style={{ height: 220, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9aa0a6', marginTop: 10 }}>{selected} 暂无历史数据</div>
+
+      {activeName && (
+        <IndexDetailModal name={activeName} />
       )}
     </section>
   )

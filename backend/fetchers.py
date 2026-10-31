@@ -1,10 +1,19 @@
+from email.utils import quote
 import time
 import re
+from zoneinfo import ZoneInfo
 import requests
 import akshare as ak
 import pandas as pd
 import datetime as _dt
 import json
+from zoneinfo import ZoneInfo
+# 东方财富等国内接口禁走系统代理
+_DIRECT = {"http": None, "https": None}
+
+# 在文件顶部随便找个位置加上你的 Key
+MX_APIKEY = "mkt_kp1A6_xrQlYEiGkA6WMJr-3jGnwXA3GmvbOVDcJMUZA" # 替换成你真实申请的 Key
+MX_API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/query"
 
 
 # ---------- 缓存 ----------
@@ -52,6 +61,7 @@ GLOBAL_INDICES = [
     {"name": "深证成指",   "sina_code": "sz399001",   "tx_code": "sz399001", "type": "a_share"},
     {"name": "创业板指",   "sina_code": "sz399006",   "tx_code": "sz399006", "type": "a_share"},
 ]
+
 
 # ---------- 实时行情 / 国内油价 ----------
 def get_cn_oil_df():
@@ -204,80 +214,52 @@ def _fetch_tencent_kline(tx_code: str):
     """获取腾讯指数日K线，解析 JSONP 格式"""
     try:
         url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-
-        params = {
-            "_var": "kline_dayqfq",
-            "param": f"{tx_code},day,,,320,qfq"
-        }
-
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
-
-        resp = requests.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=15
-        )
+        params = {"_var": "kline_dayqfq", "param": f"{tx_code},day,,,320,qfq"}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
         resp.raise_for_status()
-
-        # 腾讯返回格式：kline_dayqfq={...}
         raw = resp.text.strip()
-
         if "=" in raw:
             raw = raw.split("=", 1)[1].strip()
-
         raw = raw.rstrip(";")
-
         data = json.loads(raw)
-
         kline_data = data.get("data", {}).get(tx_code, {})
         days = kline_data.get("day") or kline_data.get("qfqday")
-
         if not days:
             print(f"腾讯K线 {tx_code} 返回为空")
             return []
-
         records = []
-
         for item in days:
             if len(item) < 3:
                 continue
-
             try:
-                records.append({
-                    "date": item[0],
-                    "value": float(item[2])
-                })
+                records.append({"date": item[0], "value": float(item[2])})
             except (ValueError, TypeError):
                 continue
-
         return records
-
     except Exception as e:
         print(f"腾讯K线获取失败 ({tx_code}): {repr(e)}")
         return []
 
 def fetch_global_index_history(tx_code: str):
     """根据指数代码选择历史数据源，统一返回最近365天的 date/value"""
+    """根据指数代码选择历史数据源（优先走妙想API）"""
+    # 1. 先尝试走妙想 API
+    mx_data = _fetch_global_index_history_mx(tx_code)
+    if mx_data:
+        print(f"✅ [妙想API] 获取 {tx_code} 历史成功, {len(mx_data)} 条")
+        return mx_data
 
+    # 2. 如果妙想失败，再退回到之前的 AkShare 接口
     try:
+        # ... (保留你原来的 akshare 逻辑，不用动) ...
+        print(f"⚠️ [妙想失败] {tx_code} 退回 AkShare 获取历史")
+
         # 1. 美国主要指数
-        us_symbols = {
-            "usDJI": ".DJI",
-            "usIXIC": ".IXIC",
-            "usINX": ".INX",
-        }
-
+        us_symbols = {"usDJI": ".DJI", "usIXIC": ".IXIC", "usINX": ".INX"}
         if tx_code in us_symbols:
-            df = ak.index_us_stock_sina(
-                symbol=us_symbols[tx_code]
-            )
-
-            return _normalize_history_df(
-                df, "date", "close", days=365
-            )
+            df = ak.index_us_stock_sina(symbol=us_symbols[tx_code])
+            return _normalize_history_df(df, "date", "close", days=365)
 
         # 2. 欧洲及日本指数
         global_symbols = {
@@ -286,44 +268,23 @@ def fetch_global_index_history(tx_code: str):
             "frCAC": "法CAC40指数",
             "jpN225": "日经225指数",
         }
-
         if tx_code in global_symbols:
-            df = ak.index_global_hist_sina(
-                symbol=global_symbols[tx_code]
-            )
-
-            # 排除未完成行情产生的零收盘价记录
-            df = df[
-                pd.to_numeric(df["close"], errors="coerce") > 0
-            ].copy()
-
-            return _normalize_history_df(
-                df, "date", "close", days=365
-            )
+            df = ak.index_global_hist_sina(symbol=global_symbols[tx_code])
+            df = df[pd.to_numeric(df["close"], errors="coerce") > 0].copy()
+            return _normalize_history_df(df, "date", "close", days=365)
 
         # 3. 恒生指数
         if tx_code == "hkHSI":
-            df = ak.stock_hk_index_daily_sina(
-                symbol="HSCCI"
-            )
-
-            return _normalize_history_df(
-                df, "date", "close", days=365
-            )
+            df = ak.stock_hk_index_daily_sina(symbol="HSCCI")
+            return _normalize_history_df(df, "date", "close", days=365)
 
         # 4. A股指数：继续使用已经验证成功的腾讯接口
         records = _fetch_tencent_kline(tx_code)
-
         df = pd.DataFrame(records)
-
-        return _normalize_history_df(
-            df, "date", "value", days=365
-        )
+        return _normalize_history_df(df, "date", "value", days=365)
 
     except Exception as e:
-        print(
-            f"全球指数历史数据获取失败 ({tx_code}): {repr(e)}"
-        )
+        print(f"全球指数历史数据获取失败 ({tx_code}): {repr(e)}")
         return []
 
 def fetch_tencent_quotes(codes):
@@ -521,8 +482,52 @@ def fetch_oil95_history():
     except Exception: return []
 
 def fetch_gold_history_intl():
-    try: return _normalize_history_df(ak.futures_foreign_hist(symbol="GC"), "date", "close")
-    except Exception: return []
+    """使用妙想API获取国际金价（COMEX黄金主力），失败则退回AkShare"""
+    headers = {"Content-Type": "application/json", "apikey": MX_APIKEY}
+    payload = {"toolQuery": "查询COMEX黄金近一年每天的收盘价"}
+    
+    try:
+        resp = requests.post(MX_API_URL, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+        
+        data_list = (
+    result.get("data", {})
+          .get("data", {})
+          .get("searchDataResultDTO", {})
+          .get("dataTableDTOList", [])
+)
+        if not data_list:
+            raise ValueError("妙想 API 返回空列表")
+            
+        for dto in data_list:
+            table = dto.get("table", {})
+            headName = table.get("headName", [])
+            # 325898 通常是收盘价
+            close_prices = table.get("325898") or table.get("100000000017527")
+            if not close_prices:
+                continue
+                
+            records = []
+            for date_str, price_str in zip(headName, close_prices):
+                try:
+                    clean_date = str(date_str).split("(")[0].split(" ")[0]
+                    clean_price = str(price_str).replace("美元", "").replace(",", "").replace("点", "")
+                    records.append({"date": clean_date, "value": float(clean_price)})
+                except (ValueError, TypeError):
+                    continue
+            
+            if records:
+                print(f"✅ [妙想API] 获取国际金价成功, {len(records)} 条")
+                return records
+    except Exception as e:
+        print(f"妙想 API 黄金获取失败，退回 AkShare: {repr(e)}")
+        
+    # 兜底：如果妙想失败，继续用 AkShare
+    try: 
+        return _normalize_history_df(ak.futures_foreign_hist(symbol="GC"), "date", "close")
+    except Exception: 
+        return []
 
 def fetch_gold_history_domestic():
     try: return _normalize_history_df(ak.spot_hist_sge(symbol="Au99.99"), "date", "close")
@@ -547,3 +552,251 @@ def fetch_fund_history(code: str):
     try:
         return _normalize_history_df(ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势"), "净值日期", "单位净值")
     except Exception: return []
+
+
+# ============================================================
+# 指数当天分时：A股/美股/港股走腾讯，德/法/日/英走东方财富
+# ============================================================
+def _fetch_index_minute_tencent(tx_code: str):
+    """A股、美股、港股：腾讯 minute/usMinute，已验证可用"""
+    if tx_code.startswith("us"):
+        api = "usMinute"
+    elif tx_code.startswith(("sh", "sz", "hk")):
+        api = "minute"
+    else:
+        return None  # 非腾讯支持的市场，交给东方财富分支
+
+    try:
+        url = f"https://web.ifzq.gtimg.cn/appstock/app/{api}/query"
+        params = {"code": tx_code}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        idx_data = payload.get("data", {}).get(tx_code, {})
+        if not isinstance(idx_data, dict):
+            return {"date": "", "data": []}
+
+        minute_info = idx_data.get("data", {}) or {}
+        minute_list = minute_info.get("data", []) or []
+        date_str = minute_info.get("date", "")
+
+        records = []
+        for line in minute_list:
+            parts = str(line).split()
+            if len(parts) < 2:
+                continue
+            try:
+                t = parts[0]
+                records.append({
+                    "time": f"{t[:2]}:{t[2:]}" if len(t) == 4 else t,
+                    "price": float(parts[1]),
+                    "volume": int(float(parts[2])) if len(parts) > 2 and parts[2] else 0,
+                })
+            except (ValueError, IndexError):
+                continue
+
+        return {"date": date_str, "data": records}
+    except Exception as e:
+        print(f"腾讯分时失败 {tx_code}: {repr(e)}")
+        return {"date": "", "data": []}
+
+
+
+def _fetch_index_minute_eastmoney(tx_code: str):
+    """使用 Yahoo Finance 获取欧洲和日本指数的分钟行情。"""
+
+    print(f"\n---> [Yahoo Finance] 开始请求 {tx_code} --")
+
+    symbol_map = {
+        "deDAX": "^GDAXI",
+        "frCAC": "^FCHI",
+        "jpN225": "^N225",
+    }
+
+    symbol = symbol_map.get(tx_code)
+
+    # 英国 FTSE 暂时保留原数据源，不在这里处理
+    if not symbol:
+        print(f"---> [Yahoo Finance] {tx_code} 暂无配置")
+        return {"date": "", "data": []}
+
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+        params = {
+            "range": "1d",
+            "interval": "5m",
+        }
+
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        }
+
+        # 使用已经验证成功的 Docker 主机代理
+        proxies = {
+            "http": "http://host.docker.internal:11888",
+            "https": "http://host.docker.internal:11888",
+        }
+
+        resp = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            proxies=proxies,
+            timeout=20,
+        )
+
+        print(
+            f"---> [Yahoo Finance] {tx_code} "
+            f"HTTP状态码: {resp.status_code}"
+        )
+
+        resp.raise_for_status()
+        payload = resp.json()
+
+        chart = payload.get("chart", {})
+        results = chart.get("result")
+
+        if not results:
+            print(f"---> [Yahoo Finance] {tx_code} 没有行情数据")
+            return {"date": "", "data": []}
+
+        item = results[0]
+        timestamps = item.get("timestamp", [])
+        quote_list = item.get("indicators", {}).get("quote", [])
+
+        if not timestamps or not quote_list:
+            print(f"---> [Yahoo Finance] {tx_code} 行情字段为空")
+            return {"date": "", "data": []}
+
+        quote = quote_list[0]
+        closes = quote.get("close", [])
+        volumes = quote.get("volume", [])
+
+        exchange_timezone = item.get("meta", {}).get(
+            "exchangeTimezoneName", "UTC"
+        )
+
+        records = []
+
+        for i, timestamp in enumerate(timestamps):
+            try:
+                price = closes[i] if i < len(closes) else None
+
+                if price is None:
+                    continue
+
+                dt = _dt.datetime.fromtimestamp(
+                    timestamp,
+                    tz=ZoneInfo(exchange_timezone)
+                )
+
+                time_str = dt.strftime("%H:%M")
+
+                volume = volumes[i] if i < len(volumes) else None
+
+                records.append({
+                    "time": time_str,
+                    "price": float(price),
+                    "volume": int(volume) if volume is not None else 0,
+                })
+
+            except (ValueError, TypeError, IndexError):
+                continue
+        
+        local_date = _dt.datetime.fromtimestamp(
+            timestamps[0],
+            tz=ZoneInfo(exchange_timezone)
+        ).date().isoformat()
+
+        print(
+            f"---> [Yahoo Finance] {tx_code} "
+            f"解析成功，共 {len(records)} 个点"
+        )
+
+        return {
+            "date": local_date,
+            "data": records,
+        }
+
+    except Exception as e:
+        print(
+            f"---> [Yahoo Finance] {tx_code} "
+            f"请求发生异常: {repr(e)}"
+        )
+        return {"date": "", "data": []}
+
+
+
+def fetch_index_minute(tx_code: str):
+    """统一入口（唯一版本）：
+    - us* / sh* / sz* / hk*  -> 腾讯接口
+    - ukFTSE / deDAX / frCAC / jpN225 -> 东方财富 trends2
+    """
+    # 1. 腾讯分支（A股 / 美股 / 港股）
+    tencent_result = _fetch_index_minute_tencent(tx_code)
+    if tencent_result is not None:
+        return tencent_result
+
+    # 2. 东方财富分支（德 / 法 / 日 / 英）
+    em_supported = {"ukFTSE", "deDAX", "frCAC", "jpN225"}
+    if tx_code in em_supported:
+        return _fetch_index_minute_eastmoney(tx_code)
+
+    return {"date": "", "data": []}
+
+def _fetch_global_index_history_mx(tx_code: str):
+    """通过妙想API获取近一年日线数据"""
+    # 映射内部代码到妙想的实体名称
+    name_map = {
+        "sh000001": "上证指数", "sz399001": "深证成指", "sz399006": "创业板指",
+        "usDJI": "道琼斯", "usIXIC": "纳斯达克", "usINX": "标普500",
+        "ukFTSE": "英国富时100指数", "deDAX": "德国DAX30指数", 
+        "frCAC": "法国CAC40指数", "jpN225": "日经225指数", "hkHSI": "恒生指数"
+    }
+    query_name = name_map.get(tx_code)
+    if not query_name:
+        return []
+
+    headers = {"Content-Type": "application/json", "apikey": MX_APIKEY}
+    payload = {"toolQuery": f"查询{query_name}近一年每天的收盘价"}
+    
+    try:
+        resp = requests.post(MX_API_URL, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+        
+        data_list = result.get("data", {}).get("dataTableDTOList", [])
+        if not data_list:
+            return []
+
+        # 遍历找包含收盘价的数据表
+        for dto in data_list:
+            table = dto.get("table", {})
+            headName = table.get("headName", [])
+            # 326269=开盘价, 325898=收盘价
+            close_prices = table.get("325898") 
+            if not close_prices:
+                continue
+                
+            records = []
+            for date_str, price_str in zip(headName, close_prices):
+                try:
+                    # date_str 可能是 "2026-10-30" 或 "2026-10-30(日)"
+                    clean_date = str(date_str).split("(")[0].split(" ")[0]
+                    # 去除 "点" 等单位
+                    clean_price = str(price_str).replace("点", "").replace(",", "")
+                    records.append({"date": clean_date, "value": float(clean_price)})
+                except (ValueError, TypeError):
+                    continue
+            
+            if records:
+                return records
+                
+    except Exception as e:
+        print(f"妙想 API 历史失败 {tx_code}: {repr(e)}")
+        
+    return []

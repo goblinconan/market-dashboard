@@ -1,8 +1,8 @@
 import ReactECharts from 'echarts-for-react'
 
-export default function MiniTrendChart({ title, data, color = '#409eff' }) {
+export default function MiniTrendChart({ title, data, color = '#409eff', showXAxis = false, height = 220 }) {
   if (!data || data.length === 0) {
-    return <div style={{ height: 220, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9aa0a6', fontSize: 12 }}>{title} 暂无数据</div>
+    return <div style={{ height, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9aa0a6', fontSize: 12 }}>{title} 暂无数据</div>
   }
 
   const dates = data.map((item) => item.date)
@@ -22,8 +22,12 @@ export default function MiniTrendChart({ title, data, color = '#409eff' }) {
       type: 'category',
       data: dates,
       axisLine: { lineStyle: { color: '#2a2e36' } },
-      axisLabel: { color: '#9aa0a6', fontSize: 10 },
-      show: false, // 隐藏X轴文字，让图表更紧凑
+      axisLabel: {
+        color: '#9aa0a6',
+        fontSize: 10,
+        interval: showXAxis ? Math.max(0, Math.floor(dates.length / 6) - 1) : 'auto',
+      },
+      show: showXAxis,   // ← 用 prop 控制
     },
     yAxis: {
       type: 'value',
@@ -50,7 +54,7 @@ export default function MiniTrendChart({ title, data, color = '#409eff' }) {
   }
 
   return (
-    <div style={{ width: '100%', height: 220 }}>
+    <div style={{ width: '100%', height }}>
       <ReactECharts option={option} style={{ height: '100%', width: '100%' }} notMerge={true} />
     </div>
   )

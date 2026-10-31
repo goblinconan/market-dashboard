@@ -13,7 +13,8 @@ from fetchers import (
     fetch_forex_history, fetch_dxy_history, fetch_brent_history, fetch_oil95_history,
     fetch_gold_history_intl, fetch_gold_history_domestic, fetch_us_bond_history,
     fetch_fund_watchlist, fetch_fund_history,
-    fetch_global_indices_quotes, fetch_global_index_history, GLOBAL_INDICES
+    fetch_global_indices_quotes, fetch_global_index_history, GLOBAL_INDICES,
+    fetch_index_minute,
 )
 
 REFRESH_INTERVAL = 60
@@ -185,6 +186,26 @@ async def get_global_indices_history(name: str):
     if data:
         _global_indices_history_cache[name] = {"data": data, "ts": now}
     return data or []
+
+# main.py 追加
+_global_indices_minute_cache = {}
+
+@app.get("/api/global_indices/minute")
+async def get_global_index_minute(name: str):
+    """当天分时数据，缓存 60 秒（实时性要求高于历史曲线）"""
+    now = time.time()
+    cached = _global_indices_minute_cache.get(name)
+    if cached and (now - cached["ts"] < 60):
+        return cached["data"]
+
+    idx_conf = next((i for i in GLOBAL_INDICES if i["name"] == name), None)
+    if not idx_conf:
+        return {"date": "", "data": []}
+
+    data = await asyncio.to_thread(fetch_index_minute, idx_conf["tx_code"])
+    if data and data.get("data"):
+        _global_indices_minute_cache[name] = {"data": data, "ts": now}
+    return data
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
