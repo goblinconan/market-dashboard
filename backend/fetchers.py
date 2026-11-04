@@ -1162,8 +1162,8 @@ def _fetch_index_minute_eastmoney_global(secid: str):
             headers=headers,
             timeout=15,
             proxies={
-                "http": "http://10.155.110.162:11888",
-                "https": "http://10.155.110.162:11888",
+                "http": "http://host.docker.internal:11888",
+                "https": "http://host.docker.internal:11888",
             }
         )
         resp.raise_for_status()
