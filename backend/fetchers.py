@@ -1,4 +1,3 @@
-from email.utils import quote
 import time
 import re
 from zoneinfo import ZoneInfo
@@ -7,7 +6,6 @@ import akshare as ak
 import pandas as pd
 import datetime as _dt
 import json
-from zoneinfo import ZoneInfo
 # 东方财富等国内接口禁走系统代理
 _DIRECT = {"http": None, "https": None}
 
@@ -80,11 +78,35 @@ def get_cn_oil_df():
             print(f"国内油价获取异常: {e}")
     return _cache_cn_df
 
+def _fix_oil_columns(df):
+    """修正 akshare/东方财富 V_92 与 V_95 列数据互换的问题"""
+    if df is None or df.empty:
+        return df
+    col_92 = next((c for c in ["V_92", "V92"] if c in df.columns), None)
+    col_95 = next((c for c in ["V_95", "V95"] if c in df.columns), None)
+    if not col_92 or not col_95:
+        return df
+    try:
+        s92 = pd.to_numeric(df[col_92], errors="coerce").dropna()
+        s95 = pd.to_numeric(df[col_95], errors="coerce").dropna()
+        # 正常情况：95 号均价 > 92 号均价；若反向则说明列数据错位
+        if not s92.empty and not s95.empty and s92.mean() > s95.mean():
+            df = df.copy()
+            df[col_92], df[col_95] = df[col_95].copy(), df[col_92].copy()
+            print("⚠️ 检测到 V_92/V_95 列数据互换，已自动修正")
+    except Exception:
+        pass
+    return df
+
+
 def get_cn_price(detail_df, grade="92", region=None):
-    if detail_df is None: return None
+    if detail_df is None:
+        return None
+    detail_df = _fix_oil_columns(detail_df)          # ← 新增这一行
     grade_str = str(grade).strip().replace("#", "")
     target_col = next((c for c in [f"V_{grade_str}", f"V{grade_str}"] if c in detail_df.columns), None)
-    if not target_col: return None
+    if not target_col:
+        return None
     if not region:
         valid = pd.to_numeric(detail_df[target_col], errors="coerce").dropna()
         return round(float(valid.mean()), 2) if not valid.empty else None
@@ -179,6 +201,70 @@ def fetch_us_treasury_yields():
 
 # ---------- A 股 / 个股 / 全球指数 ----------
 def fetch_global_indices_quotes():
+    # ---------- 先通过腾讯获取美股三大指数（实时） ----------
+    us_codes = {"usDJI": "int_dji", "usIXIC": "int_nasdaq", "usINX": "int_sp500"}
+    tencent_parsed = {}
+    try:
+        tx_url = f"https://qt.gtimg.cn/q={','.join(us_codes.keys())}"
+        tx_headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.qq.com/"}
+        tx_resp = requests.get(tx_url, headers=tx_headers, timeout=5, proxies=_DIRECT)
+        for line in tx_resp.text.split(";"):
+            m = re.search(r'v_(\w+)="([^"]*)"', line)
+            if m:
+                fields = m.group(2).split("~")
+                if len(fields) > 32:
+                    tencent_parsed[us_codes[m.group(1)]] = {
+                        "price": round(float(fields[3]), 2),
+                        "change_pct": round(float(fields[32]), 2),
+                    }
+    except Exception:
+        pass
+
+    # ---------- 新浪批量请求（A股、港股、欧股、日经仍走新浪） ----------
+    codes = [idx["sina_code"] for idx in GLOBAL_INDICES]
+    url = f"https://hq.sinajs.cn/list={','.join(codes)}"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+    parsed = {}
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.encoding = "gbk"
+        for line in resp.text.split(";"):
+            match = re.search(r'hq_str_(\w+)="([^"]*)"', line)
+            if match:
+                code = match.group(1)
+                fields = match.group(2).split(",")
+                idx_conf = next((i for i in GLOBAL_INDICES if i["sina_code"] == code), None)
+                if not idx_conf or len(fields) < 4:
+                    continue
+                try:
+                    if idx_conf["type"] == "global":
+                        parsed[code] = {
+                            "price": round(float(fields[1]), 2),
+                            "change_pct": round(float(fields[3]), 2),
+                        }
+                    elif idx_conf["type"] == "hk":
+                        parsed[code] = {
+                            "price": round(float(fields[6]), 2),
+                            "change_pct": round(float(fields[8]), 2),
+                        }
+                    else:
+                        prev_close = float(fields[2])
+                        price = float(fields[3])
+                        pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+                        parsed[code] = {"price": round(price, 2), "change_pct": round(pct, 2)}
+                except (ValueError, IndexError):
+                    pass
+    except Exception:
+        pass
+
+    # ---------- 腾讯美股数据覆盖新浪数据 ----------
+    parsed.update(tencent_parsed)
+
+    return [
+        {**idx, "price": parsed.get(idx["sina_code"], {}).get("price"),
+         "change_pct": parsed.get(idx["sina_code"], {}).get("change_pct")}
+        for idx in GLOBAL_INDICES
+    ]
     """获取全球主要指数的实时行情"""
     codes = [idx["sina_code"] for idx in GLOBAL_INDICES]
     url = f"https://hq.sinajs.cn/list={','.join(codes)}"
@@ -409,20 +495,56 @@ def fetch_600188_history(days: int = 365):
     return fetch_stock_history("sh600188", days)
 
 def fetch_stock_minute(full_code: str):
+    """
+    获取个股/ETF的当天分钟分时数据。
+    统一使用腾讯接口，避免新浪接口（akshare）因0成交量导致的除零异常。
+    """
     try:
-        try:
-            df = ak.stock_zh_a_minute(symbol=full_code, period='1', adjust='qfq')
-        except Exception:
-            df = ak.stock_zh_a_minute(symbol=full_code, period='1', adjust='')
-        if df is None or df.empty: return []
-        df['day'] = pd.to_datetime(df['day'])
-        df = df[df['day'].dt.date == df['day'].dt.date.max()].copy()
-        df['close'] = pd.to_numeric(df['close'], errors='coerce')
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-        df['amount'] = df['close'] * df['volume']
-        df['avg_price'] = df['amount'].cumsum() / df['volume'].cumsum()
-        return [{"time": row['day'].strftime("%H:%M"), "price": round(float(row['close']), 2), "avg_price": round(float(row['avg_price']), 2), "volume": int(row['volume']) if not pd.isna(row['volume']) else 0} for _, row in df.iterrows()]
-    except Exception: return []
+        url = f"https://web.ifzq.gtimg.cn/appstock/app/minute/query"
+        params = {"code": full_code}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json()
+        
+        idx_data = payload.get("data", {}).get(full_code, {})
+        if not isinstance(idx_data, dict):
+            return []
+            
+        minute_info = idx_data.get("data", {}) or {}
+        minute_list = minute_info.get("data", []) or []
+        
+        records = []
+        cum_vol = 0
+        cum_amt = 0
+        
+        for line in minute_list:
+            parts = str(line).split()
+            if len(parts) < 2:
+                continue
+            try:
+                t = parts[0]
+                price = float(parts[1])
+                volume = int(float(parts[2])) if len(parts) > 2 and parts[2] else 0
+                
+                # 累加成交量和成交额，实时计算均价
+                cum_vol += volume
+                cum_amt += price * volume
+                avg_price = cum_amt / cum_vol if cum_vol > 0 else price
+                
+                records.append({
+                    "time": f"{t[:2]}:{t[2:]}" if len(t) == 4 else t,
+                    "price": round(price, 2),
+                    "avg_price": round(avg_price, 2),
+                    "volume": volume,
+                })
+            except (ValueError, IndexError):
+                continue
+                
+        return records
+    except Exception as e:
+        print(f"腾讯个股分时获取失败 {full_code}: {repr(e)}")
+        return []
 
 def _normalize_history_df(df, date_col_hint=None, value_col_hint=None, days=365):
     if df is None or df.empty: return []
@@ -605,23 +727,26 @@ def _fetch_index_minute_tencent(tx_code: str):
 
 
 def _fetch_index_minute_eastmoney(tx_code: str):
-    """使用 Yahoo Finance 获取欧洲和日本指数的分钟行情。"""
+    """欧洲和日本指数分时：日经走新浪，欧股继续走 Yahoo"""
 
-    print(f"\n---> [Yahoo Finance] 开始请求 {tx_code} --")
+    # ---------- 日经：改用新浪分时接口 ----------
+    if tx_code == "jpN225":
+        return _fetch_index_minute_eastmoney_global("100.N225")
 
+    # ---------- 欧股：保留 Yahoo 分支 ----------
     symbol_map = {
+        "ukFTSE": "^FTSE",
         "deDAX": "^GDAXI",
         "frCAC": "^FCHI",
-        "jpN225": "^N225",
     }
+    # ... 原有 Yahoo 逻辑保持不变 ...
 
     symbol = symbol_map.get(tx_code)
-
-    # 英国 FTSE 暂时保留原数据源，不在这里处理
     if not symbol:
         print(f"---> [Yahoo Finance] {tx_code} 暂无配置")
         return {"date": "", "data": []}
 
+    # ... 后续逻辑不变
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
@@ -729,7 +854,45 @@ def _fetch_index_minute_eastmoney(tx_code: str):
         )
         return {"date": "", "data": []}
 
+def _fetch_index_minute_sina(sina_code: str):
+    """新浪财经国际指数分时，适用于 znb_NKY 等"""
+    try:
+        url = (
+            "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/"
+            f"var%20t1{sina_code}=/Global_IndexService.getTimeLine"
+            f"?symbol={sina_code}"
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://finance.sina.com.cn/",
+        }
+        resp = requests.get(url, headers=headers, timeout=10, proxies=_DIRECT)
+        resp.raise_for_status()
 
+        match = re.search(r'"([\s\S]*?)"', resp.text)
+        if not match:
+            return {"date": "", "data": []}
+
+        records = []
+        for item in match.group(1).split("|"):
+            parts = item.strip().split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                t = parts[0]  # "09:00" 或 "0900"
+                time_str = f"{t[:2]}:{t[2:]}" if len(t) == 4 and t.isdigit() else t
+                records.append({
+                    "time": time_str,
+                    "price": float(parts[1]),
+                    "volume": int(float(parts[2])) if len(parts) > 2 and parts[2] else 0,
+                })
+            except (ValueError, IndexError):
+                continue
+
+        return {"date": "", "data": records}
+    except Exception as e:
+        print(f"新浪分时失败 {sina_code}: {repr(e)}")
+        return {"date": "", "data": []}
 
 def fetch_index_minute(tx_code: str):
     """统一入口（唯一版本）：
@@ -980,3 +1143,55 @@ def _get_fallback_news():
             "source": "资本市场"
         }
     ]
+
+def _fetch_index_minute_eastmoney_global(secid: str):
+    """东方财富全球指数分时，适用于日经 100.N225"""
+    try:
+        url = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
+        params = {
+            "secid": secid,
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "ndays": "1",
+            "iscr": "0",
+        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=15,
+            proxies={
+                "http": "http://10.155.110.162:11888",
+                "https": "http://10.155.110.162:11888",
+            }
+        )
+        resp.raise_for_status()
+        data = resp.json().get("data")
+        if not data:
+            return {"date": "", "data": []}
+
+        trends = data.get("trends") or []
+        records = []
+        for line in trends:
+            parts = str(line).split(",")
+            if len(parts) < 3:
+                continue
+            try:
+                dt_str = parts[0]  # "2026-11-04 09:00"
+                time_str = dt_str.split(" ")[-1][:5]
+                price = float(parts[1])  # 最新指数价格
+                records.append({
+                    "time": time_str,
+                    "price": round(price, 2),
+                    "volume": int(float(parts[5])) if len(parts) > 5 and parts[5] else 0,
+                })
+            except (ValueError, IndexError):
+                continue
+
+        trade_date = data.get("trends", [""])[0][:10] if trends else ""
+        return {"date": trade_date, "data": records}
+
+    except Exception as e:
+        print(f"东财全球分时失败 {secid}: {repr(e)}")
+        return {"date": "", "data": []}
